@@ -12,8 +12,12 @@ const URL: &str = "https://api.pwnedpasswords.com/range/";
 ///
 /// Shards are named after the 5-hex-digit prefix of the hashes they contain,
 /// which is also the k-anonymity prefix used by the range API.
+///
+/// The name is split across two levels, `AB/CDE.gz`, so a full corpus is 256
+/// directories of 4096 files rather than one directory holding a million.
 pub fn shard_path(cache_dir: &Path, id: usize) -> PathBuf {
-    cache_dir.join(format!("{id:05X}.gz"))
+    let name = format!("{id:05X}");
+    cache_dir.join(&name[..2]).join(format!("{}.gz", &name[2..]))
 }
 
 struct MyProgress {
@@ -146,6 +150,10 @@ fn write_piece(cache_dir: &Path, piece: &Piece) -> std::io::Result<()> {
     let name = shard_path(cache_dir, piece.id);
     let name_tmp = name.with_extension("tmp");
 
+    // the per-prefix subdirectory may not exist yet
+    if let Some(parent) = name.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     {
         let f = std::fs::File::create(&name_tmp)?;
         let f = std::io::BufWriter::new(f);
