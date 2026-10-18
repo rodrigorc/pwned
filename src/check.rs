@@ -38,9 +38,9 @@ impl CheckResult {
     }
 }
 
-pub async fn check(pwd: &str, cache_dir: &std::path::Path) -> Result<CheckResult> {
+pub async fn check(pwd: &[u8], cache_dir: &std::path::Path) -> Result<CheckResult> {
     let mut hasher = sha1::Sha1::default();
-    hasher.update(pwd.as_bytes());
+    hasher.update(pwd);
     let hash = hasher.finalize();
     let mut target = String::new();
     for c in hash {

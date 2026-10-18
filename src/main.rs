@@ -142,12 +142,18 @@ async fn run() -> Result<bool> {
             download::download(&cache_dir, concurrency).await?;
         }
         Commands::Check { password, file, file0, json } => {
-            let passwords: Vec<String> = match (password, file, file0) {
-                (Some(passwords), None, None) => passwords,
+            // File input is used byte-for-byte; arguments and prompts are text,
+            // so they are the only paths that need encoding.
+            let passwords: Vec<Vec<u8>> = match (password, file, file0) {
+                (Some(passwords), None, None) => passwords
+                    .iter()
+                    .map(|pwd| pwd.as_bytes().to_vec())
+                    .collect(),
                 (None, Some(file), None) => read_passwords(&file, b'\n')?,
                 (None, None, Some(file)) => read_passwords(&file, 0)?,
                 (None, None, None) => vec![passterm::prompt_password_tty(Some("Password: "))
-                    .context("could not read a password from the terminal")?],
+                    .context("could not read a password from the terminal")?
+                    .into_bytes()],
                 // clap's `source` group rejects this, but don't panic if it ever slips through
                 _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
             };
@@ -182,7 +188,11 @@ async fn run() -> Result<bool> {
 /// For newline-separated input a trailing `\r` is stripped to tolerate CRLF
 /// files. For NUL-separated input newlines are preserved, since they may be
 /// part of the password itself.
-fn read_passwords(file: &PathBuf, separator: u8) -> Result<Vec<String>> {
+///
+/// Records are returned as the literal bytes read. The corpus holds hashes of
+/// whatever bytes were leaked, so a file in Latin-1 (or any other encoding) is
+/// checked as-is instead of being forced through UTF-8.
+fn read_passwords(file: &PathBuf, separator: u8) -> Result<Vec<Vec<u8>>> {
     let mut reader: Box<dyn BufRead> = if file == &PathBuf::from("-") {
         Box::new(BufReader::new(std::io::stdin()))
     } else {
@@ -207,9 +217,8 @@ fn read_passwords(file: &PathBuf, separator: u8) -> Result<Vec<String>> {
                 record.pop();
             }
         }
-        // passwords are text: reject invalid UTF-8 rather than hashing garbage
-        let password = String::from_utf8(std::mem::take(&mut record))
-            .context("input contains a password that is not valid UTF-8")?;
+        // passwords are bytes: hash exactly what the file contains
+        let password = std::mem::take(&mut record);
         if !password.is_empty() {
             passwords.push(password);
         }
