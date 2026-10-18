@@ -59,6 +59,12 @@ enum Commands {
         /// Use this when a password may itself contain newlines.
         #[arg(long)]
         file0: Option<PathBuf>,
+
+        /// Print results as a JSON array
+        ///
+        /// Errors and log messages go to stderr, so stdout stays parseable.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -84,7 +90,7 @@ async fn main() -> Result<()> {
         Commands::Download => {
             download::download(&cache_dir).await?;
         }
-        Commands::Check { password, file, file0 } => {
+        Commands::Check { password, file, file0, json } => {
             let passwords: Vec<String> = match (password, file, file0) {
                 (Some(passwords), None, None) => passwords,
                 (None, Some(file), None) => read_passwords(&file, b'\n')?,
@@ -94,10 +100,22 @@ async fn main() -> Result<()> {
                 // clap's `source` group rejects this, but don't panic if it ever slips through
                 _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
             };
+            // Buffer results rather than streaming them. A check that fails
+            // partway must not leave a half-written array on stdout: emitting
+            // nothing keeps stdout parseable and lets the exit code carry the
+            // failure, which matters more than early output on a slow run.
+            let mut items: Vec<String> = Vec::new();
             for password in passwords {
                 let res = check::check(&password, &cache_dir).await?;
                 any_pwned |= res.is_pwned();
-                println!("{res}");
+                if json {
+                    items.push(res.to_json());
+                } else {
+                    println!("{res}");
+                }
+            }
+            if json {
+                println!("[{}]", items.join(","));
             }
         }
     }
