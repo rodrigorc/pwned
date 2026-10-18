@@ -3,9 +3,24 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::num::NonZeroUsize;
+use std::process::ExitCode;
 
 /// Exit code returned when at least one checked password was found in the corpus.
-const EXIT_CODE_PWNED: i32 = 1;
+const EXIT_CODE_PWNED: u8 = 1;
+
+/// Exit code for a run that failed for an operational reason, or that panicked.
+///
+/// Picked to stay clear of the two codes a caller is most likely to care about:
+/// `1` means "found something", and clap owns `2` for usage errors. Neither can
+/// be used to signal a broken run, so `pwned` reports:
+///
+/// | code | meaning                                    |
+/// |------|--------------------------------------------|
+/// | 0    | success; nothing was found                 |
+/// | 1    | at least one password was found            |
+/// | 2    | usage error (printed by clap, never by us) |
+/// | 3    | operational failure, including a panic     |
+const EXIT_CODE_OPERATIONAL: u8 = 3;
 
 /// Where the corpus is stored, if `--cache-dir` was not given.
 ///
@@ -18,6 +33,20 @@ fn default_cache_dir() -> Result<PathBuf> {
             "could not determine the default cache directory; \
              pass one explicitly with --cache-dir",
         )
+}
+
+/// Makes a panic exit the process instead of being swallowed.
+///
+/// Most of the work happens in spawned tokio tasks, and a panic in a task that
+/// is never joined is caught by the runtime: the task dies, the run carries on,
+/// and the process can still exit `0`. Reporting a crash as success is the worst
+/// possible outcome, so keep the default message and then exit non-zero.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(EXIT_CODE_OPERATIONAL.into());
+    }));
 }
 
 mod download;
@@ -77,13 +106,28 @@ enum Commands {
 
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_millis()
         .parse_default_env()
         .init();
 
+    install_panic_hook();
+
+    match run().await {
+        Ok(true) => ExitCode::from(EXIT_CODE_PWNED),
+        Ok(false) => ExitCode::SUCCESS,
+        // print the full context chain, the way returning `Err` from `main` did
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(EXIT_CODE_OPERATIONAL)
+        }
+    }
+}
+
+/// Runs the selected subcommand, reporting whether any password was pwned.
+async fn run() -> Result<bool> {
     let args = Cli::parse();
 
     let cache_dir: PathBuf = match args.cache_dir {
@@ -127,10 +171,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if any_pwned {
-        std::process::exit(EXIT_CODE_PWNED);
-    }
-    Ok(())
+    Ok(any_pwned)
 }
 
 /// Reads passwords to check from `file`, separated by `separator`.
