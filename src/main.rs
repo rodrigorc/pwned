@@ -2,6 +2,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::num::NonZeroUsize;
 
 /// Exit code returned when at least one checked password was found in the corpus.
 const EXIT_CODE_PWNED: i32 = 1;
@@ -38,7 +39,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Download the full Pwned Passwords corpus into local shard files
-    Download,
+    Download {
+        /// Number of shards to download concurrently
+        ///
+        /// Defaults to four times the CPU count, capped at 64.
+        #[arg(short = 'j', long, value_name = "N")]
+        concurrency: Option<NonZeroUsize>,
+    },
 
     /// Check passwords against the local corpus
     ///
@@ -87,8 +94,8 @@ async fn main() -> Result<()> {
     let mut any_pwned = false;
 
     match args.command {
-        Commands::Download => {
-            download::download(&cache_dir).await?;
+        Commands::Download { concurrency } => {
+            download::download(&cache_dir, concurrency).await?;
         }
         Commands::Check { password, file, file0, json } => {
             let passwords: Vec<String> = match (password, file, file0) {

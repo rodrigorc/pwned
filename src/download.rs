@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use anyhow::Result;
@@ -30,7 +31,7 @@ enum ProgressEvent {
     Error(String),
 }
 
-pub async fn download(cache_dir: &Path) -> Result<()> {
+pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Result<()> {
     std::fs::create_dir_all(cache_dir)?;
 
 
@@ -60,7 +61,14 @@ pub async fn download(cache_dir: &Path) -> Result<()> {
             .build()
             .unwrap();
 
-        let sema = tokio::sync::Semaphore::new((num_tasks * 4).min(64));
+        // `--concurrency` is the exact number of in-flight downloads; without it,
+        // run several per CPU thread since each is waiting on the network, not on
+        // the CPU, and keep the existing cap so the API is not hammered.
+        let permits = match concurrency {
+            Some(n) => n.get(),
+            None => (num_tasks * 4).min(64),
+        };
+        let sema = tokio::sync::Semaphore::new(permits);
         let sema = Arc::new(sema);
         let cache_dir = cache_dir.to_path_buf();
         async move {
