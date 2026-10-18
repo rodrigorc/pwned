@@ -1,5 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use anyhow::{Context, Result};
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 /// Exit code returned when at least one checked password was found in the corpus.
 const EXIT_CODE_PWNED: i32 = 1;
@@ -24,9 +26,22 @@ enum Commands {
     /// Check passwords against the local corpus
     ///
     /// Prompts securely on a TTY when no password is given as an argument.
+    #[command(group = ArgGroup::new("source")
+        .multiple(false)
+        .args(["password", "file", "file0"]))]
     Check {
         /// Passwords to check; omit to be prompted securely
         password: Option<Vec<String>>,
+
+        /// Read passwords from a file, one per line ("-" reads standard input)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Read NUL-separated passwords from a file ("-" reads standard input)
+        ///
+        /// Use this when a password may itself contain newlines.
+        #[arg(long)]
+        file0: Option<PathBuf>,
     },
 }
 
@@ -47,11 +62,15 @@ async fn main() -> Result<()> {
         Commands::Download => {
             download::download().await?;
         }
-        Commands::Check { password } => {
-            let passwords: Vec<String> = match password {
-                Some(passwords) => passwords,
-                None => vec![passterm::prompt_password_tty(Some("Password: "))
+        Commands::Check { password, file, file0 } => {
+            let passwords: Vec<String> = match (password, file, file0) {
+                (Some(passwords), None, None) => passwords,
+                (None, Some(file), None) => read_passwords(&file, b'\n')?,
+                (None, None, Some(file)) => read_passwords(&file, 0)?,
+                (None, None, None) => vec![passterm::prompt_password_tty(Some("Password: "))
                     .context("could not read a password from the terminal")?],
+                // clap's `source` group rejects this, but don't panic if it ever slips through
+                _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
             };
             for password in passwords {
                 let res = check::check(&password).await?;
@@ -65,6 +84,49 @@ async fn main() -> Result<()> {
         std::process::exit(EXIT_CODE_PWNED);
     }
     Ok(())
+}
+
+/// Reads passwords to check from `file`, separated by `separator`.
+///
+/// A `file` of `-` means standard input. Empty records are skipped so that
+/// trailing separators and empty input don't get hashed as an empty password.
+///
+/// For newline-separated input a trailing `\r` is stripped to tolerate CRLF
+/// files. For NUL-separated input newlines are preserved, since they may be
+/// part of the password itself.
+fn read_passwords(file: &PathBuf, separator: u8) -> Result<Vec<String>> {
+    let mut reader: Box<dyn BufRead> = if file == &PathBuf::from("-") {
+        Box::new(BufReader::new(std::io::stdin()))
+    } else {
+        let f = std::fs::File::open(file)
+            .with_context(|| format!("could not open {}", file.display()))?;
+        Box::new(BufReader::new(f))
+    };
+
+    let mut passwords = Vec::new();
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        if reader.read_until(separator, &mut record)? == 0 {
+            break;
+        }
+        // read_until includes the separator; drop it
+        if record.last() == Some(&separator) {
+            record.pop();
+        }
+        if separator == b'\n' {
+            while record.last() == Some(&b'\r') {
+                record.pop();
+            }
+        }
+        // passwords are text: reject invalid UTF-8 rather than hashing garbage
+        let password = String::from_utf8(std::mem::take(&mut record))
+            .context("input contains a password that is not valid UTF-8")?;
+        if !password.is_empty() {
+            passwords.push(password);
+        }
+    }
+    Ok(passwords)
 }
 
 
