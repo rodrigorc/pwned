@@ -1,11 +1,20 @@
 use std::sync::Arc;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use anyhow::Result;
 use bytes::Bytes;
 use http::Uri;
 
 const URL: &str = "https://api.pwnedpasswords.com/range/";
+
+/// Path of the gzipped shard `id` inside `cache_dir`.
+///
+/// Shards are named after the 5-hex-digit prefix of the hashes they contain,
+/// which is also the k-anonymity prefix used by the range API.
+pub fn shard_path(cache_dir: &Path, id: usize) -> PathBuf {
+    cache_dir.join(format!("{id:05X}.gz"))
+}
 
 struct MyProgress {
     count: usize,
@@ -17,8 +26,8 @@ enum ProgressEvent {
     Error(String),
 }
 
-pub async fn download() -> Result<()> {
-    std::fs::create_dir_all("out/pwned")?;
+pub async fn download(cache_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)?;
 
 
     let num_tasks = std::thread::available_parallelism().map(|x| x.into()).unwrap_or(1);
@@ -49,12 +58,13 @@ pub async fn download() -> Result<()> {
 
         let sema = tokio::sync::Semaphore::new((num_tasks * 4).min(64));
         let sema = Arc::new(sema);
+        let cache_dir = cache_dir.to_path_buf();
         async move {
             for id in 0..0x1_00000 {
                 let permit = sema.clone().acquire_owned().await.unwrap();
-                let name = format!("out/pwned/{:05X}.gz", id);
+                let name = shard_path(&cache_dir, id);
 
-                if std::fs::exists(name).unwrap() {
+                if std::fs::exists(&name).unwrap() {
                     // already downloaded, just report
                     tx.send(ProgressEvent::Block).await.unwrap();
                     continue;
@@ -63,6 +73,7 @@ pub async fn download() -> Result<()> {
                 tokio::spawn({
                     let tx = tx.clone();
                     let client = client.clone();
+                    let cache_dir = cache_dir.clone();
                     async move {
                         let mut retry = 0;
                         let piece = loop {
@@ -80,7 +91,7 @@ pub async fn download() -> Result<()> {
                                 }
                             }
                         };
-                        write_piece(&piece).unwrap();
+                        write_piece(&cache_dir, &piece).unwrap();
                         tx.send(ProgressEvent::Block).await.unwrap();
                        drop(permit);
                     }
@@ -129,11 +140,10 @@ async fn download_piece(client: &reqwest::Client, id: usize) -> Result<Piece> {
     Ok(Piece { id, data })
 }
 
-fn write_piece(piece: &Piece) -> std::io::Result<()> {
-    use std::path::PathBuf;
+fn write_piece(cache_dir: &Path, piece: &Piece) -> std::io::Result<()> {
     use std::io::Write;
 
-    let name = PathBuf::from(format!("out/pwned/{:05X}.gz", piece.id));
+    let name = shard_path(cache_dir, piece.id);
     let name_tmp = name.with_extension("tmp");
 
     {
@@ -146,19 +156,58 @@ fn write_piece(piece: &Piece) -> std::io::Result<()> {
     Ok(())
 }
 
-pub async fn obtain_piece(id: usize) -> Result<Piece> {
-    let name = format!("out/pwned/{:05X}.gz", id);
-    if std::fs::exists(&name)? {
-        let f = std::fs::File::open(name)?;
-        let f = std::io::BufReader::new(f);
-        let mut gz = flate2::read::GzDecoder::new(f);
+/// Reads the cached shard `id` from disk, returning `None` on a cache miss.
+///
+/// A shard that is present but cannot be read is deleted and treated as a miss,
+/// so the cache repairs itself on the next read. That covers both the shard
+/// being unreadable and it being truncated or otherwise corrupt.
+///
+/// An empty decompression result is also a miss. A valid gzip stream over empty
+/// input is not an error, so this is the only guard against a corrupt shard
+/// reading as zero hashes and silently reporting every password as safe.
+fn read_cached_piece(cache_dir: &Path, id: usize) -> Result<Option<Vec<u8>>> {
+    let name = shard_path(cache_dir, id);
+    if !std::fs::exists(&name)? {
+        return Ok(None);
+    }
+
+    let decoded = (|| -> std::io::Result<Vec<u8>> {
+        let f = std::fs::File::open(&name)?;
+        let mut gz = flate2::read::GzDecoder::new(std::io::BufReader::new(f));
         let mut data = Vec::new();
         gz.read_to_end(&mut data)?;
+        Ok(data)
+    })();
+
+    match decoded {
+        // an empty read is as useless as a failed one: see doc comment
+        Ok(data) if !data.is_empty() => Ok(Some(data)),
+        result => {
+            let why = match &result {
+                Err(e) => e.to_string(),
+                Ok(_) => "decompressed to nothing".to_owned(),
+            };
+            log::error!("removing unreadable cache shard {}: {why}", name.display());
+            if let Err(e) = std::fs::remove_file(&name) {
+                log::error!("could not remove {}: {e}", name.display());
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub async fn obtain_piece(id: usize, cache_dir: &Path) -> Result<Piece> {
+    if let Some(data) = read_cached_piece(cache_dir, id)? {
         return Ok(Piece { id, data: data.into() });
     }
     let client = reqwest::Client::new();
     let piece = download_piece(&client, id).await?;
-    // writing the piece is not mandatory
-    let _ = write_piece(&piece);
+    // writing the piece is not mandatory: a read-only or full cache should still
+    // answer the check, it just won't be reused next time
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        log::error!("could not create cache dir {}: {e}", cache_dir.display());
+    } else if let Err(e) = write_piece(cache_dir, &piece) {
+        log::error!("could not cache shard {id:05X} in {}: {e}", cache_dir.display());
+    }
     Ok(piece)
 }

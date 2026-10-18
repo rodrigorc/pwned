@@ -6,6 +6,19 @@ use std::path::PathBuf;
 /// Exit code returned when at least one checked password was found in the corpus.
 const EXIT_CODE_PWNED: i32 = 1;
 
+/// Where the corpus is stored, if `--cache-dir` was not given.
+///
+/// Follows each platform's convention: `$XDG_CACHE_HOME/pwned` or `~/.cache/pwned`
+/// on Linux, `~/Library/Caches/pwned` on macOS, `%LOCALAPPDATA%\pwned\cache` on Windows.
+fn default_cache_dir() -> Result<PathBuf> {
+    directories::ProjectDirs::from("", "", "pwned")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .context(
+            "could not determine the default cache directory; \
+             pass one explicitly with --cache-dir",
+        )
+}
+
 mod download;
 mod check;
 
@@ -14,6 +27,10 @@ mod check;
 #[command(version)]
 #[command(about = "Search for pwned passwords", long_about = None)]
 struct Cli {
+    /// Directory holding the downloaded corpus
+    #[arg(short = 'd', long, global = true, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -56,11 +73,16 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
+    let cache_dir: PathBuf = match args.cache_dir {
+        Some(dir) => dir,
+        None => default_cache_dir()?,
+    };
+
     let mut any_pwned = false;
 
     match args.command {
         Commands::Download => {
-            download::download().await?;
+            download::download(&cache_dir).await?;
         }
         Commands::Check { password, file, file0 } => {
             let passwords: Vec<String> = match (password, file, file0) {
@@ -73,7 +95,7 @@ async fn main() -> Result<()> {
                 _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
             };
             for password in passwords {
-                let res = check::check(&password).await?;
+                let res = check::check(&password, &cache_dir).await?;
                 any_pwned |= res.is_pwned();
                 println!("{res}");
             }

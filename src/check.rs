@@ -23,7 +23,7 @@ impl CheckResult {
     }
 }
 
-pub async fn check(pwd: &str) -> Result<CheckResult> {
+pub async fn check(pwd: &str, cache_dir: &std::path::Path) -> Result<CheckResult> {
     let mut hasher = sha1::Sha1::default();
     hasher.update(pwd.as_bytes());
     let hash = hasher.finalize();
@@ -36,7 +36,7 @@ pub async fn check(pwd: &str) -> Result<CheckResult> {
     let tail = &target[5..];
     let id = usize::from_str_radix(head, 16).unwrap();
 
-    let piece = crate::download::obtain_piece(id).await?;
+    let piece = crate::download::obtain_piece(id, cache_dir).await?;
 
     for line in piece.data.split(|&c| c == b'\n') {
         let mut ws = line.split(|&c| c == b':');
