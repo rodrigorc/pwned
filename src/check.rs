@@ -18,7 +18,7 @@ impl std::fmt::Display for CheckResult {
 }
 
 impl CheckResult {
-    pub fn _is_pwned(&self) -> bool {
+    pub fn is_pwned(&self) -> bool {
         self.pwned.is_some()
     }
 }
