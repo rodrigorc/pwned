@@ -1,0 +1,18 @@
+[package]
+name = "pwned-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Rodrigo Rivas Costa <rodrigorivascosta@gmail.com>"]
+description = "HaveIBeenPwned client library"
+repository = "https://github.com/rodrigorc/pwned"
+
+[dependencies]
+reqwest = { version = "0.13.4", features = ["gzip", "deflate"] }
+tokio = { version = "1.54.0", features = ["rt", "sync", "time"] }
+sha1 = "0.11.0"
+anyhow = "1.0.104"
+flate2 = "1.1.10"
+log = "0.4.34"
+bytes = "1.12.1"
+http = "1.5.0"

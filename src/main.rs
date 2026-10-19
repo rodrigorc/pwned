@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
+use pwned_core::{check, download};
+use pwned_core::download::Progress;
+
 /// Exit code returned when at least one checked password was found in the corpus.
 const EXIT_CODE_PWNED: u8 = 1;
 
@@ -49,8 +52,41 @@ fn install_panic_hook() {
     }));
 }
 
-mod download;
-mod check;
+/// Draws the progress reported by `download` onto a terminal bar.
+///
+/// Kept here rather than in the library so that embedding `pwned-core` never
+/// writes to anyone's stdout.
+struct ProgressPrinter {
+    count: usize,
+    pb: progress_bar::pb::ProgressBar,
+}
+
+impl ProgressPrinter {
+    fn new() -> Self {
+        let mut pb = progress_bar::pb::ProgressBar::new_with_eta(0.3, 0x1_00000 / 0x400);
+        pb.set_progress_style(progress_bar::ProgressStyle::Percentage);
+        pb.set_action("Downloading", progress_bar::Color::Blue, progress_bar::Style::Bold);
+        ProgressPrinter { count: 0, pb }
+    }
+
+    fn on_progress(&mut self, ev: Progress) {
+        match ev {
+            Progress::Shard => {
+                self.count += 1;
+                if self.count % 0x400 == 0 {
+                    self.pb.inc();
+                }
+            }
+            Progress::Error(msg) => {
+                self.pb.print_info("error", &msg, progress_bar::Color::Red, progress_bar::Style::Bold);
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        self.pb.finalize();
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "pwned")]
@@ -139,7 +175,9 @@ async fn run() -> Result<bool> {
 
     match args.command {
         Commands::Download { concurrency } => {
-            download::download(&cache_dir, concurrency).await?;
+            let mut bar = ProgressPrinter::new();
+            download::download(&cache_dir, concurrency, |ev| bar.on_progress(ev)).await?;
+            bar.finish();
         }
         Commands::Check { password, file, file0, json } => {
             // File input is used byte-for-byte; arguments and prompts are text,
@@ -163,7 +201,7 @@ async fn run() -> Result<bool> {
             // failure, which matters more than early output on a slow run.
             let mut items: Vec<String> = Vec::new();
             for password in passwords {
-                let res = check::check(&password, &cache_dir).await?;
+                let res = check::check(&password, Some(&cache_dir)).await?;
                 any_pwned |= res.is_pwned();
                 if json {
                     items.push(res.to_json());

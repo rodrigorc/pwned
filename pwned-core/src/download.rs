@@ -21,31 +21,29 @@ pub fn shard_path(cache_dir: &Path, id: usize) -> PathBuf {
     cache_dir.join(&name[..2]).join(format!("{}.gz", &name[2..]))
 }
 
-struct MyProgress {
-    count: usize,
-    pb: progress_bar::pb::ProgressBar,
-}
-
-enum ProgressEvent {
-    Block,
+/// Progress reported by [`download`] through the caller's callback.
+#[derive(Debug)]
+pub enum Progress {
+    /// A shard is now in the cache: downloaded now, or already present.
+    Shard,
+    /// An attempt failed; the download retries it on its own.
     Error(String),
 }
 
-pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Result<()> {
+/// Fetches every shard missing from `cache_dir`, reporting progress as it goes.
+///
+/// Rendering that progress — a bar, logs, a GUI — is the caller's business;
+/// this only says what happened.
+pub async fn download(
+    cache_dir: &Path,
+    concurrency: Option<NonZeroUsize>,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<()> {
     std::fs::create_dir_all(cache_dir)?;
-
 
     let num_tasks = std::thread::available_parallelism().map(|x| x.into()).unwrap_or(1);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(num_tasks);
-
-    let mut progress = progress_bar::pb::ProgressBar::new_with_eta(0.3, 0x1_00000 / 0x400);
-    progress.set_progress_style(progress_bar::ProgressStyle::Percentage);
-    progress.set_action("Downloading", progress_bar::Color::Blue, progress_bar::Style::Bold);
-    let mut progress = MyProgress {
-        count: 0,
-        pb: progress,
-    };
 
     tokio::spawn({
         let retry_policy = reqwest::retry::for_host(Uri::from_static(URL).host().unwrap().to_string())
@@ -78,7 +76,7 @@ pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Re
 
                 if std::fs::exists(&name).unwrap() {
                     // already downloaded, just report
-                    tx.send(ProgressEvent::Block).await.unwrap();
+                    tx.send(Progress::Shard).await.unwrap();
                     continue;
                 }
 
@@ -95,7 +93,7 @@ pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Re
                                     retry += 1;
                                     // report the error
                                     let msg = format!("error in piece 0x{id:X}, #{retry}: {e:#?}");
-                                    tx.send(ProgressEvent::Error(msg)).await.unwrap();
+                                    tx.send(Progress::Error(msg)).await.unwrap();
                                     if retry == 4 {
                                         panic!("too many errors in the same piece");
                                     }
@@ -104,7 +102,7 @@ pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Re
                             }
                         };
                         write_piece(&cache_dir, &piece).unwrap();
-                        tx.send(ProgressEvent::Block).await.unwrap();
+                        tx.send(Progress::Shard).await.unwrap();
                        drop(permit);
                     }
                 });
@@ -114,20 +112,9 @@ pub async fn download(cache_dir: &Path, concurrency: Option<NonZeroUsize>) -> Re
 
 
     while let Some(ev) = rx.recv().await {
-        match ev {
-            ProgressEvent::Block => {
-                progress.count += 1;
-                if progress.count % 0x400 == 0 {
-                    progress.pb.inc();
-                }
-            }
-            ProgressEvent::Error(msg) => {
-                progress.pb.print_info("error", &msg, progress_bar::Color::Red, progress_bar::Style::Bold);
-            }
-        }
+        on_progress(ev);
     }
 
-    progress.pb.finalize();
     Ok(())
 }
 
@@ -212,18 +199,23 @@ fn read_cached_piece(cache_dir: &Path, id: usize) -> Result<Option<Vec<u8>>> {
     }
 }
 
-pub async fn obtain_piece(id: usize, cache_dir: &Path) -> Result<Piece> {
-    if let Some(data) = read_cached_piece(cache_dir, id)? {
+pub async fn obtain_piece(id: usize, cache_dir: Option<&Path>) -> Result<Piece> {
+    if let Some(cache_dir) = cache_dir && let Some(data) = read_cached_piece(cache_dir, id)? {
         return Ok(Piece { id, data: data.into() });
     }
+
     let client = reqwest::Client::new();
     let piece = download_piece(&client, id).await?;
-    // writing the piece is not mandatory: a read-only or full cache should still
-    // answer the check, it just won't be reused next time
-    if let Err(e) = std::fs::create_dir_all(cache_dir) {
-        log::error!("could not create cache dir {}: {e}", cache_dir.display());
-    } else if let Err(e) = write_piece(cache_dir, &piece) {
-        log::error!("could not cache shard {id:05X} in {}: {e}", cache_dir.display());
+
+    if let Some(cache_dir) = cache_dir {
+        // writing the piece is not mandatory: a read-only or full cache should still
+        // answer the check, it just won't be reused next time
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
+            log::error!("could not create cache dir {}: {e}", cache_dir.display());
+        } else if let Err(e) = write_piece(cache_dir, &piece) {
+            log::error!("could not cache shard {id:05X} in {}: {e}", cache_dir.display());
+        }
     }
+
     Ok(piece)
 }

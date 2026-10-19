@@ -1110,15 +1110,25 @@ name = "pwned"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
  "directories",
  "env_logger",
- "flate2",
- "http",
  "log",
  "passterm",
  "progress_bar",
+ "pwned-core",
+ "tokio",
+]
+
+[[package]]
+name = "pwned-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "flate2",
+ "http",
+ "log",
  "reqwest",
  "sha1",
  "tokio",
@@ -1671,9 +1681,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.3"
+version = "1.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
+checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
 dependencies = [
  "bytes",
  "libc",

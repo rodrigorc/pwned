@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::{fmt::Write, path::Path};
 use sha1::Digest;
 use anyhow::Result;
 
@@ -38,7 +38,7 @@ impl CheckResult {
     }
 }
 
-pub async fn check(pwd: &[u8], cache_dir: &std::path::Path) -> Result<CheckResult> {
+pub async fn check(pwd: &[u8], cache_dir: Option<&Path>) -> Result<CheckResult> {
     let mut hasher = sha1::Sha1::default();
     hasher.update(pwd);
     let hash = hasher.finalize();
