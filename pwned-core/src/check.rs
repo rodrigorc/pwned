@@ -2,39 +2,23 @@ use std::{fmt::Write, path::Path};
 use sha1::Digest;
 use anyhow::Result;
 
+/// The outcome of checking one password: whether it shows up in the corpus,
+/// and the SHA-1 hash it was looked up by.
+///
+/// Presenting a result is the front-end's business, so this type has no
+/// `Display` nor JSON methods: what the output looks like is a decision for
+/// whoever writes to a terminal, and `pwned-core` never writes anywhere.
+#[derive(Debug)]
 pub struct CheckResult {
+    /// Times the password appears in the corpus, `None` when it never does.
     pub pwned: Option<u32>,
+    /// Uppercase hex SHA-1 of the password.
     pub hash: String,
-}
-
-impl std::fmt::Display for CheckResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self.pwned {
-            Some(x) => write!(f, "XXX {} is pwned {} times", self.hash, x)?,
-            None => write!(f, "    {} is not pwned!", self.hash)?,
-        }
-        Ok(())
-    }
 }
 
 impl CheckResult {
     pub fn is_pwned(&self) -> bool {
         self.pwned.is_some()
-    }
-
-    /// Renders this result as a single JSON object.
-    ///
-    /// `count` is the number of times the password appears in the corpus, or
-    /// null when it does not appear at all.
-    ///
-    /// Written by hand rather than via `serde_json`: the only field holding
-    /// user-derived data is the hash, which is uppercase hex and so always safe
-    /// to embed. If that stops being true, this needs a real serializer.
-    pub fn to_json(&self) -> String {
-        match self.pwned {
-            Some(count) => format!(r#"{{"hash":"{}","pwned":true,"count":{count}}}"#, self.hash),
-            None => format!(r#"{{"hash":"{}","pwned":false,"count":null}}"#, self.hash),
-        }
     }
 }
 

@@ -63,6 +63,38 @@ The JSON array is buffered and printed in one go at the end, so a check that fai
 nothing to stdout rather than leaving a half-finished array behind; plain output is streamed as each
 password is checked. Errors and log messages always go to stderr.
 
+## Checking a CSV export
+
+Most password managers can export the whole vault as CSV. `check-csv` checks one of those exports
+straight from the pipe, so the clear passwords never reach the disk:
+
+```sh
+keepassxc-cli export -f csv passwords.kdbx | pwned check-csv
+pwned check-csv < test.csv               # an export already on hand works too
+pwned check-csv --json < test.csv
+```
+
+The first record must be a header naming the `Group`, `Title` and `Password` columns. Matching is
+case-insensitive and every other column is ignored, so a straight export works as it comes out of the
+manager — KeePassXC writes all three, and the rest of its columns are skipped. Quoting, commas and
+newlines inside a field follow the usual CSV rules.
+
+Each result is reported under the entry's `Group/Title` instead of the password hash:
+
+```
+XXX Root/lwn is pwned 52372427 times
+    Root/Netflix is not pwned!
+```
+
+And with `--json`, `id` takes the place `hash` has in `check`:
+
+```json
+[{"id":"Root/lwn","pwned":true,"count":52372427},
+ {"id":"Root/Netflix","pwned":false,"count":null}]
+```
+
+Records with an empty password are skipped, and the exit codes are the ones listed below.
+
 ## Downloading the corpus
 
 ```sh
@@ -134,6 +166,8 @@ Two things to keep in mind:
   encoding itself can produce a `0x0A` byte inside a character (UTF-16, for example).
 * Passwords given as arguments or typed at the prompt are text and are therefore treated as UTF-8;
   only file input is byte-for-byte.
+* `check-csv` reads the `Password` column byte-for-byte too, modulo the usual CSV quoting. Only the
+  `Group/Title` label is decoded — and it is decoded lossily, since all it does is get printed.
 
 ## Library
 
@@ -164,7 +198,9 @@ download::download(cache_dir, None, |event| match event {
 .await?;
 ```
 
-Rendering progress is the caller's business, which is why the library never writes to your stdout.
+Rendering is the caller's business, which is why the library never writes to your stdout: progress
+from `download` as in the second example, and the format of a `CheckResult` in the first — the type
+is plain data, `pwned` and `hash`, and how to print it is a decision left to whoever has the terminal.
 
 ## License
 

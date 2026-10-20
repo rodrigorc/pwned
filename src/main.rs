@@ -1,7 +1,8 @@
 use clap::{ArgGroup, Parser, Subcommand};
 use anyhow::{Context, Result};
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
@@ -138,6 +139,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Check a password manager's CSV export, read from standard input
+    ///
+    /// The export must start with a header naming the Group, Title and
+    /// Password columns; every other column is ignored. Each password is
+    /// checked as usual, but reported under its `Group/Title` identifier
+    /// instead of the hash.
+    ///
+    /// Standard input only: the point is to pipe the export straight out of
+    /// the manager, so the clear passwords never touch the disk.
+    CheckCsv {
+        /// Print results as a JSON array
+        ///
+        /// Errors and log messages go to stderr, so stdout stays parseable.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 
@@ -195,27 +213,110 @@ async fn run() -> Result<bool> {
                 // clap's `source` group rejects this, but don't panic if it ever slips through
                 _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
             };
-            // Buffer results rather than streaming them. A check that fails
-            // partway must not leave a half-written array on stdout: emitting
-            // nothing keeps stdout parseable and lets the exit code carry the
-            // failure, which matters more than early output on a slow run.
-            let mut items: Vec<String> = Vec::new();
-            for password in passwords {
-                let res = check::check(&password, Some(&cache_dir)).await?;
-                any_pwned |= res.is_pwned();
-                if json {
-                    items.push(res.to_json());
-                } else {
-                    println!("{res}");
-                }
-            }
-            if json {
-                println!("[{}]", items.join(","));
-            }
+            let items = passwords.into_iter().map(|pwd| (None, pwd)).collect();
+            any_pwned |= run_checks(items, &cache_dir, json).await?;
+        }
+        Commands::CheckCsv { json } => {
+            let items = read_csv_passwords()?
+                .into_iter()
+                .map(|entry| (Some(entry.id), entry.password))
+                .collect();
+            any_pwned |= run_checks(items, &cache_dir, json).await?;
         }
     }
 
     Ok(any_pwned)
+}
+
+/// Checks every password, prints its result, and reports whether any was pwned.
+///
+/// Each item pairs the password bytes with an optional label that names the
+/// entry in the output: `check-csv` supplies the entry's `Group/Title`, while
+/// plain `check` passes `None` and gets the password hash instead.
+///
+/// Results are buffered rather than streamed in JSON mode. A check that fails
+/// partway must not leave a half-written array on stdout: emitting nothing
+/// keeps stdout parseable and lets the exit code carry the failure, which
+/// matters more than early output on a slow run. Plain output is streamed as
+/// each password is checked.
+async fn run_checks(
+    items: Vec<(Option<String>, Vec<u8>)>,
+    cache_dir: &Path,
+    json: bool,
+) -> Result<bool> {
+    let mut any_pwned = false;
+    let mut rendered: Vec<String> = Vec::new();
+    for (label, password) in items {
+        let res = check::check(&password, Some(cache_dir)).await?;
+        any_pwned |= res.is_pwned();
+        // Plain `check` names the entry by its hash, `check-csv` by Group/Title.
+        let (key, label) = match &label {
+            Some(id) => ("id", id.as_str()),
+            None => ("hash", res.hash.as_str()),
+        };
+        if json {
+            rendered.push(to_json(&res, key, label));
+        } else {
+            println!("{}", to_line(&res, label));
+        }
+    }
+    if json {
+        println!("[{}]", rendered.join(","));
+    }
+    Ok(any_pwned)
+}
+
+/// Renders one result as a plain line of output.
+///
+/// `label` names the entry: the password hash for `check`, its `Group/Title`
+/// for `check-csv`.
+///
+/// ```text
+/// XXX 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8 is pwned 52372427 times
+///     Root/Netflix is not pwned!
+/// ```
+fn to_line(res: &check::CheckResult, label: &str) -> String {
+    match res.pwned {
+        Some(count) => format!("XXX {label} is pwned {count} times"),
+        None => format!("    {label} is not pwned!"),
+    }
+}
+
+/// Renders one result as a single JSON object, for one element of the array
+/// printed by `--json`.
+///
+/// `key`/`label` identify the entry: `"hash"` with the password hash for
+/// `check`, `"id"` with the `Group/Title` for `check-csv`. `count` is how many
+/// times the password appears in the corpus, or null when it never does.
+///
+/// Written by hand rather than via `serde_json`: the only variable parts are
+/// the label, which is escaped, and the count, which is a number.
+fn to_json(res: &check::CheckResult, key: &str, label: &str) -> String {
+    let label = json_escape(label);
+    match res.pwned {
+        Some(count) => format!(r#"{{"{key}":"{label}","pwned":true,"count":{count}}}"#),
+        None => format!(r#"{{"{key}":"{label}","pwned":false,"count":null}}"#),
+    }
+}
+
+/// Escapes `text` so it can be embedded between the quotes of a JSON string.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // the control characters JSON does not allow raw
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Reads passwords to check from `file`, separated by `separator`.
@@ -262,6 +363,86 @@ fn read_passwords(file: &PathBuf, separator: u8) -> Result<Vec<Vec<u8>>> {
         }
     }
     Ok(passwords)
+}
+
+/// One entry of a password manager's CSV export: its name and its password.
+struct CsvEntry {
+    /// How the entry is reported in place of the password hash: `Group/Title`.
+    id: String,
+    /// The password, bytes exactly as the export holds them.
+    password: Vec<u8>,
+}
+
+/// Reads a password manager's CSV export from standard input.
+///
+/// The first record must be a header naming the `Group`, `Title` and
+/// `Password` columns. Matching is case-insensitive and any other column is
+/// ignored, so a straight export works as it comes out of the manager. Each
+/// entry becomes a `Group/Title` identifier plus its password bytes.
+///
+/// Standard input is the only source on purpose: writing the export to a file
+/// first would put every clear password on disk, which is what this subcommand
+/// exists to avoid.
+///
+/// Password bytes are kept exactly as the file holds them, the same as
+/// [`read_passwords`]; the identifier only ever gets printed, so it is decoded
+/// lossily. Records with no password in them are skipped.
+fn read_csv_passwords() -> Result<Vec<CsvEntry>> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .context("could not read the CSV from standard input")?;
+    // A byte-order mark in front of the header would become part of the name
+    // of the first column.
+    if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        input.drain(..3);
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        // A record shorter than the header is one lacking those columns, not
+        // a reason to reject the whole export.
+        .flexible(true)
+        .from_reader(input.as_slice());
+
+    let header = reader
+        .byte_headers()
+        .context("could not read the header of the CSV")?
+        .clone();
+    let names = header
+        .iter()
+        .map(|field| String::from_utf8_lossy(field.trim_ascii()).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let column = |name: &str| -> Result<usize> {
+        header
+            .iter()
+            .position(|field| field.trim_ascii().eq_ignore_ascii_case(name.as_bytes()))
+            .with_context(|| format!("the CSV header has no {name} column (found: {names})"))
+    };
+    let group = column("Group")?;
+    let title = column("Title")?;
+    let password = column("Password")?;
+
+    let mut entries = Vec::new();
+    for (index, record) in reader.byte_records().enumerate() {
+        let record = record
+            .with_context(|| format!("could not read record {} of the CSV", index + 1))?;
+        // Nothing to check without a password, same as the empty records
+        // `read_passwords` skips.
+        let Some(pwd) = record.get(password).filter(|pwd| !pwd.is_empty()) else {
+            continue;
+        };
+        let id = format!(
+            "{}/{}",
+            String::from_utf8_lossy(record.get(group).unwrap_or(b"")),
+            String::from_utf8_lossy(record.get(title).unwrap_or(b"")),
+        );
+        entries.push(CsvEntry {
+            id,
+            password: pwd.to_vec(),
+        });
+    }
+    Ok(entries)
 }
 
 
