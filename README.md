@@ -46,6 +46,19 @@ pwned check --file0 passwords.bin   # NUL-separated, for passwords containing ne
 pwned check --file passwords.txt --json
 ```
 
+If the passwords are already hashed, `--hash` checks them directly instead of hashing them a
+second time:
+
+```sh
+pwned check --hash 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8
+pwned check --hash 5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8  # case does not matter
+pwned check --hash --file hashes.txt
+```
+
+The values must be complete 40-digit SHA-1 hashes, in upper- or lowercase; results report them in
+uppercase. Since there is nothing useful to type at a prompt, `--hash` requires a hash as an
+argument or from `--file`/`--file0` and never falls back to interactive input.
+
 ```
 XXX 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8 is pwned 52372427 times
     2692E3EAAADD5F7F35A5673433ADAF95C555AA1A is not pwned!
@@ -94,6 +107,19 @@ And with `--json`, `id` takes the place `hash` has in `check`:
 ```
 
 Records with an empty password are skipped, and the exit codes are the ones listed below.
+
+## KeePassXC Okon compatibility
+
+KeePassXC can use `pwned` through its Okon interface:
+
+```sh
+touch /tmp/dummy.okon
+keepassxc-cli analyze --hibp /tmp/dummy.okon --okon pwned Passwords.kdbx
+```
+
+The `.okon` file only signals that `pwned` should use the Okon protocol; KeePassXC calls it once per
+password and reads back `1` (pwned) or `0` (not pwned). Empty passwords are treated as not pwned, so
+entries without a password do not show up as leaks.
 
 ## Downloading the corpus
 
@@ -189,6 +215,9 @@ let result = check::check(password_bytes, Some(cache_dir)).await?;
 if result.is_pwned() {
     println!("seen {} times", result.pwned.unwrap());
 }
+
+// Or look up a password that is already hashed. Either hex case works.
+let result = check::check_hash("5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8", Some(cache_dir)).await?;
 
 // Fetch every missing shard, drawing progress however you like.
 download::download(cache_dir, None, |event| match event {

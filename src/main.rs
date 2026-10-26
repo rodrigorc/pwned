@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read};
@@ -11,6 +11,13 @@ use pwned_core::download::Progress;
 
 /// Exit code returned when at least one checked password was found in the corpus.
 const EXIT_CODE_PWNED: u8 = 1;
+
+/// SHA-1 of the empty string.
+///
+/// KeePassXC passes this hash for entries with an empty password. It is present
+/// in the corpus, so Okon mode treats it as "not pwned" instead of reporting a
+/// false positive.
+const EMPTY_SHA1: &[u8] = b"DA39A3EE5E6B4B0D3255BFEF95601890AFD80709";
 
 /// Exit code for a run that failed for an operational reason, or that panicked.
 ///
@@ -99,7 +106,53 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Arguments for `check`, used when `--path` is given without a subcommand
+    #[command(flatten)]
+    check: CheckArgs,
+}
+
+/// Arguments for `check`, shared by the explicit subcommand and Okon mode.
+#[derive(Debug, Args)]
+// Only `password`, `file` and `file0` form an input group. Skip the group the
+// derive would otherwise build from every field, or flags like `--json` would
+// conflict with the password.
+#[group(skip)]
+struct CheckArgs {
+    /// Passwords to check; omit to be prompted securely
+    #[arg(group = "source", conflicts_with_all = ["file", "file0"])]
+    password: Option<Vec<String>>,
+
+    /// Read passwords from a file, one per line ("-" reads standard input)
+    #[arg(short, long, group = "source", conflicts_with = "file0")]
+    file: Option<PathBuf>,
+
+    /// Read NUL-separated passwords from a file ("-" reads standard input)
+    ///
+    /// Use this when a password may itself contain newlines.
+    #[arg(long, group = "source")]
+    file0: Option<PathBuf>,
+
+    /// Treat the input as SHA-1 hashes instead of clear passwords
+    ///
+    /// Hashes may be written in either case. Prompting is not supported:
+    /// there is nothing useful to type at the terminal, so a hash must come
+    /// from an argument, --file or --file0.
+    #[arg(long, requires = "source")]
+    hash: bool,
+
+    /// Print results as a JSON array
+    ///
+    /// Errors and log messages go to stderr, so stdout stays parseable.
+    #[arg(long)]
+    json: bool,
+
+    /// Internal: path used by password managers for compatibility
+    ///
+    /// A path ending in `.okon` enables Okon compatibility mode.
+    #[arg(long, hide = true, value_name = "PATH")]
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,29 +169,7 @@ enum Commands {
     /// Check passwords against the local corpus
     ///
     /// Prompts securely on a TTY when no password is given as an argument.
-    #[command(group = ArgGroup::new("source")
-        .multiple(false)
-        .args(["password", "file", "file0"]))]
-    Check {
-        /// Passwords to check; omit to be prompted securely
-        password: Option<Vec<String>>,
-
-        /// Read passwords from a file, one per line ("-" reads standard input)
-        #[arg(short, long)]
-        file: Option<PathBuf>,
-
-        /// Read NUL-separated passwords from a file ("-" reads standard input)
-        ///
-        /// Use this when a password may itself contain newlines.
-        #[arg(long)]
-        file0: Option<PathBuf>,
-
-        /// Print results as a JSON array
-        ///
-        /// Errors and log messages go to stderr, so stdout stays parseable.
-        #[arg(long)]
-        json: bool,
-    },
+    Check(CheckArgs),
 
     /// Check a password manager's CSV export, read from standard input
     ///
@@ -192,40 +223,86 @@ async fn run() -> Result<bool> {
     let mut any_pwned = false;
 
     match args.command {
-        Commands::Download { concurrency } => {
+        Some(Commands::Download { concurrency }) => {
             let mut bar = ProgressPrinter::new();
             download::download(&cache_dir, concurrency, |ev| bar.on_progress(ev)).await?;
             bar.finish();
         }
-        Commands::Check { password, file, file0, json } => {
-            // File input is used byte-for-byte; arguments and prompts are text,
-            // so they are the only paths that need encoding.
-            let passwords: Vec<Vec<u8>> = match (password, file, file0) {
-                (Some(passwords), None, None) => passwords
-                    .iter()
-                    .map(|pwd| pwd.as_bytes().to_vec())
-                    .collect(),
-                (None, Some(file), None) => read_passwords(&file, b'\n')?,
-                (None, None, Some(file)) => read_passwords(&file, 0)?,
-                (None, None, None) => vec![passterm::prompt_password_tty(Some("Password: "))
-                    .context("could not read a password from the terminal")?
-                    .into_bytes()],
-                // clap's `source` group rejects this, but don't panic if it ever slips through
-                _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
-            };
-            let items = passwords.into_iter().map(|pwd| (None, pwd)).collect();
-            any_pwned |= run_checks(items, &cache_dir, json).await?;
+        Some(Commands::Check(check)) => {
+            any_pwned |= run_check(check, &cache_dir).await?;
         }
-        Commands::CheckCsv { json } => {
+        Some(Commands::CheckCsv { json }) => {
             let items = read_csv_passwords()?
                 .into_iter()
                 .map(|entry| (Some(entry.id), entry.password))
                 .collect();
-            any_pwned |= run_checks(items, &cache_dir, json).await?;
+            any_pwned |= run_checks(items, &cache_dir, json, false, false).await?;
+        }
+        None => {
+            if args.check.path.is_none() {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::MissingSubcommand,
+                        "a subcommand is required",
+                    )
+                    .exit();
+            }
+            any_pwned |= run_check(args.check, &cache_dir).await?;
         }
     }
 
     Ok(any_pwned)
+}
+
+/// Runs one `check` invocation, reporting whether any password was pwned.
+async fn run_check(args: CheckArgs, cache_dir: &Path) -> Result<bool> {
+    let CheckArgs {
+        password,
+        file,
+        file0,
+        hash,
+        json,
+        path,
+    } = args;
+
+    if let Some(path) = &path
+        && path.extension().and_then(|ext| ext.to_str()) != Some("okon")
+    {
+        anyhow::bail!(
+            "--path must point to a file with the .okon extension: {}",
+            path.display()
+        );
+    }
+    // File input is used byte-for-byte; arguments and prompts are text,
+    // so they are the only paths that need encoding.
+    let passwords: Vec<Vec<u8>> = match (password, file, file0) {
+        (Some(passwords), None, None) => passwords
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+        (None, Some(file), None) => read_passwords(&file, b'\n')?,
+        (None, None, Some(file)) => read_passwords(&file, 0)?,
+        (None, None, None) => {
+            // clap rejects `--hash` without a source, but keep the
+            // guarantee even if that ever slips through: a hash typed
+            // at the prompt would just be a string with no password
+            // behind it.
+            if hash {
+                anyhow::bail!(
+                    "--hash needs a hash as an argument or in --file/--file0; \
+                     hashes cannot be entered interactively"
+                );
+            }
+            vec![passterm::prompt_password_tty(Some("Password: "))
+                .context("could not read a password from the terminal")?
+                .into_bytes()]
+        }
+        // clap's `source` group rejects this, but don't panic if it ever slips through
+        _ => anyhow::bail!("give passwords as arguments, --file or --file0, not together"),
+    };
+    let items = passwords.into_iter().map(|pwd| (None, pwd)).collect();
+    let okon = path.is_some();
+    run_checks(items, cache_dir, json, hash, okon).await
 }
 
 /// Checks every password, prints its result, and reports whether any was pwned.
@@ -233,6 +310,13 @@ async fn run() -> Result<bool> {
 /// Each item pairs the password bytes with an optional label that names the
 /// entry in the output: `check-csv` supplies the entry's `Group/Title`, while
 /// plain `check` passes `None` and gets the password hash instead.
+///
+/// When `hashed` is set, each item holds a hexadecimal SHA-1 hash rather than
+/// clear password bytes; hashes are accepted in either case.
+///
+/// When `okon` is set, each result is printed as `1` (pwned) or `0` (not
+/// pwned), with nothing else on stdout. This is the output Okon expects; it
+/// also takes precedence over `--json`.
 ///
 /// Results are buffered rather than streamed in JSON mode. A check that fails
 /// partway must not leave a half-written array on stdout: emitting nothing
@@ -243,12 +327,37 @@ async fn run_checks(
     items: Vec<(Option<String>, Vec<u8>)>,
     cache_dir: &Path,
     json: bool,
+    hashed: bool,
+    okon: bool,
 ) -> Result<bool> {
     let mut any_pwned = false;
     let mut rendered: Vec<String> = Vec::new();
     for (label, password) in items {
-        let res = check::check(&password, Some(cache_dir)).await?;
-        any_pwned |= res.is_pwned();
+        // KeePassXC calls into Okon mode for every entry, including entries
+        // with an empty password. The corpus contains the empty string, so
+        // checking it would report every such entry as leaked.
+        let empty = if hashed {
+            password.eq_ignore_ascii_case(EMPTY_SHA1)
+        } else {
+            password.is_empty()
+        };
+        if okon && empty {
+            println!("0");
+            continue;
+        }
+        let res = if hashed {
+            let hash = std::str::from_utf8(&password)
+                .context("a hashed password must be ASCII hexadecimal")?;
+            check::check_hash(hash, Some(cache_dir)).await?
+        } else {
+            check::check(&password, Some(cache_dir)).await?
+        };
+        let pwned = res.is_pwned();
+        any_pwned |= pwned;
+        if okon {
+            println!("{}", if pwned { "1" } else { "0" });
+            continue;
+        }
         // Plain `check` names the entry by its hash, `check-csv` by Group/Title.
         let (key, label) = match &label {
             Some(id) => ("id", id.as_str()),
@@ -260,7 +369,7 @@ async fn run_checks(
             println!("{}", to_line(&res, label));
         }
     }
-    if json {
+    if json && !okon {
         println!("[{}]", rendered.join(","));
     }
     Ok(any_pwned)
